@@ -6,7 +6,7 @@ An OFX plugin with Chromium built in: every OGraf template becomes a Flame effec
 template's fields (name, title, colours…) become ordinary Flame controls. Change a value and the
 frame re-renders. No intermediate render, no image sequence, no import dialog.
 
-![Recolouring an OGraf lower third live in Flame](docs/flame-accent.gif)
+![Editing an OGraf lower third's fields from its node controls in Flame](docs/flame-edit.gif)
 
 - **One node per template.** Every `.ograf.zip` in your template folders appears under
   **OGraf** in Flame's OFX browser, named after the template.
