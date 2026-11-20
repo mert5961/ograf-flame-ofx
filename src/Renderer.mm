@@ -39,6 +39,17 @@ namespace ograf {
 namespace {
 
 constexpr const char* kOrigin = "https://ograf.local/";
+// Chromium presents a frame progressively as its raster tiles finish, and a repaint request can
+// return the previous frame before the new one has been drawn; either way the missing tiles are
+// fully transparent. A frame is therefore only accepted once the view has stopped changing for
+// kSettleMs after the page reported it ready.
+constexpr double kSettleMs = 40;
+constexpr double kMaxSettleMs = 1000;
+
+double NowMs() {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // ---------- NSApp protocol (required by CEF on macOS) ----------
 BOOL g_handlingSendEvent = NO;
@@ -136,6 +147,9 @@ struct Pending {
   int id = 0;
   void* session = nullptr;
   bool waitingForPaint = false;
+  double readyAt = 0;    // when the page reported the frame ready
+  double changedAt = 0;  // when the view last showed different pixels
+  bool painted = false;  // `pixels` holds a paint received while waiting
   std::atomic<bool> done{false};
   bool ok = false;
   std::string error;
@@ -156,6 +170,34 @@ void Complete(const std::shared_ptr<Pending>& p, bool ok, const std::string& err
   p->done = true;
   if (g_pending == p) g_pending.reset();
   dispatch_semaphore_signal(p->semaphore);
+}
+
+// Completes `p` once the view has been unchanged for kSettleMs (see kSettleMs). Returns true
+// when `p` is finished. Main thread only.
+bool CheckSettle(const std::shared_ptr<Pending>& p) {
+  if (p->done) return true;
+  if (!p->waitingForPaint) return false;
+  double now = NowMs();
+  if (p->painted && now - p->changedAt >= kSettleMs) {
+    Complete(p, true, "");
+  } else if (now - p->readyAt >= kMaxSettleMs) {
+    if (!p->painted) {
+      Complete(p, false, "Chromium did not paint the frame");
+    } else {
+      Log("frame %d: view still changing after %.0f ms, using the latest paint", p->id, kMaxSettleMs);
+      Complete(p, true, "");
+    }
+  }
+  return p->done;
+}
+
+// Re-checks `p` on the main queue until it settles. A render called on the main thread blocks
+// that queue, so its pump loop also calls CheckSettle directly.
+void WaitForSettle(std::shared_ptr<Pending> p) {
+  if (CheckSettle(p)) return;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    WaitForSettle(p);
+  });
 }
 
 int g_pumpCount = 0;
@@ -192,7 +234,13 @@ class App : public CefApp, public CefBrowserProcessHandler {
     for (const char* sw : {"disable-gpu", "disable-gpu-compositing", "use-mock-keychain",
                            "disable-background-timer-throttling", "disable-renderer-backgrounding",
                            "disable-backgrounding-occluded-windows", "mute-audio", "no-first-run",
-                           "disable-component-update", "hide-scrollbars"})
+                           "disable-component-update", "hide-scrollbars",
+                           // Deterministic frames: never draw before every tile is rasterized and
+                           // every image is decoded. Without these the compositor can present a
+                           // frame with unfinished tiles, which come out as transparent blocks.
+                           "run-all-compositor-stages-before-draw", "disable-checker-imaging",
+                           "disable-image-animation-resync", "disable-threaded-animation",
+                           "disable-new-content-rendering-timeout"})
       cl->AppendSwitch(sw);
     cl->AppendSwitchWithValue("force-color-profile", "srgb");
   }
@@ -265,8 +313,12 @@ class Session : public CefClient,
       return;
     }
     const auto* bytes = static_cast<const uint8_t*>(buffer);
-    p->pixels.assign(bytes, bytes + static_cast<size_t>(w) * h * 4);
-    Complete(p, true, "");
+    const size_t size = static_cast<size_t>(w) * h * 4;
+    if (!p->painted || memcmp(p->pixels.data(), bytes, size) != 0) {
+      p->pixels.assign(bytes, bytes + size);
+      p->changedAt = NowMs();
+    }
+    p->painted = true;
   }
 
   // CefLoadHandler
@@ -311,7 +363,9 @@ class Session : public CefClient,
       auto p = g_pending;
       if (p && p->session == this && p->id == id) {
         p->waitingForPaint = true;
+        p->readyAt = p->changedAt = NowMs();
         browser_->GetHost()->Invalidate(PET_VIEW);
+        WaitForSettle(p);
       }
       return true;
     }
@@ -384,7 +438,10 @@ class Session : public CefClient,
         "});window.__loaded=true;}if(window.__key!==K){await g.setActionsSchedule({schedule:S});"
         "window.__key=K;}await g.goToTime({timestamp:" +
         ts +
-        "});await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));"
+        "});const I=[],q=n=>{for(const e of n.querySelectorAll('*')){if(e instanceof "
+        "HTMLImageElement||e instanceof SVGImageElement)I.push(e);if(e.shadowRoot)q(e.shadowRoot);}};"
+        "q(document);await Promise.all(I.map(i=>i.decode?i.decode().catch(()=>{}):0));"
+        "await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));"
         "console.log('__OGRAF_DONE__:" +
         id + "');}catch(e){console.log('__OGRAF_ERR__:" + id + ":'+(e&&e.stack||e));}})();";
     browser_->GetMainFrame()->ExecuteJavaScript(js, std::string(kOrigin) + "__frame.js", 0);
@@ -511,6 +568,7 @@ bool RenderFrame(const FrameRequest& request, std::vector<uint8_t>& bgra, std::s
     auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeoutSec);
     while (!p->done && std::chrono::steady_clock::now() < deadline) {
       PumpOnce();
+      if (CheckSettle(p)) break;
       usleep(2000);
     }
     if (!p->done) Complete(p, false, "timed out waiting for Chromium");
